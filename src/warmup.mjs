@@ -630,6 +630,47 @@ export function createWarmup(ctx) {
       .finally(() => pendingRefresh.delete(sn));
   }
 
+  // ── the recordings a device keeps on its own storage (/records, /record-thumbnail) ──
+  // Per device, record_id -> on-device cover path, from the last listing; a thumbnail is asked by record id
+  // so a caller can only request covers the device itself listed.
+  const recordCovers = new Map();
+
+  /**
+   * The device's own recordings, newest first, via the SDK's `getStationRecords` (`startDate`/`endDate`
+   * yyyyMMdd, `limit`). Under the DB lock: the read pages over the session's shared `dbChunk` stream.
+   * Remembers each row's cover path for {@link recordThumbnail}.
+   */
+  function listRecords(sn, opts = {}) {
+    return withDbLock(async () => {
+      const rows = await eufy.getStationRecords(sn, opts);
+      const covers = recordCovers.get(sn) ?? new Map();
+      for (const rec of rows) {
+        const p = cropPathOf(rec);
+        if (rec.record_id != null && p) covers.set(String(rec.record_id), p);
+      }
+      recordCovers.set(sn, covers);
+      return rows;
+    });
+  }
+
+  /**
+   * The JPEG cover of one of the device's recordings, by `record_id`, or undefined when the device lists no
+   * such record or its cover does not arrive. An id not seen yet triggers a default listing first.
+   */
+  async function recordThumbnail(sn, recordId) {
+    const id = String(recordId);
+    if (!recordCovers.get(sn)?.has(id)) await listRecords(sn);
+    const filePath = recordCovers.get(sn)?.get(id);
+    if (!filePath) return undefined;
+    return withDbLock(async () => {
+      const stationSn = eufy.deviceState?.(sn)?.stationSn ?? sn;
+      const session = stationSessions().get(stationSn);
+      if (!session?.isConnected) return undefined;
+      const devs = await eufy.getDevices();
+      return fetchImage(session, filePath, await accountIdOf(devs), p2pDidOf(devs, stationSn));
+    });
+  }
+
   // EUFY_LOCAL_EVENT_REFRESH=0 (bridge #139): skip the HomeBase/local-storage P2P reads for an account
   // where they return nothing but still hammer the camera — the on-detection cover refresh, the startup
   // face-roster + last-event warm-ups, and the /event-image auto-heal. The push-thumbnail path
@@ -646,5 +687,7 @@ export function createWarmup(ctx) {
     onDetectionRefresh: localEventRefresh ? onDetectionRefresh : noop,
     forceRefreshEventImage,
     autoHealEventImage: localEventRefresh ? autoHealEventImage : noop,
+    listRecords,
+    recordThumbnail,
   };
 }

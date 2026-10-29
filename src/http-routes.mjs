@@ -1,5 +1,5 @@
 // HTTP surface: live video (go2rtc pulls /stream/<sn>), a snapshot still, the persisted last-event
-// thumbnail, the latest detection's stored clip, and /healthz. Video is deliberately OFF the WS — connecting to /stream is what opens the
+// thumbnail, the latest detection's stored clip, the device's own recordings list and covers, and /healthz. Video is deliberately OFF the WS — connecting to /stream is what opens the
 // camera, disconnecting is what stops it, so there's no "is it streaming" flag to drift. Returns the
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
@@ -296,6 +296,50 @@ export function createHttpHandler(ctx) {
       }
       res.writeHead(200, { "content-type": "video/mp4", "content-length": clip.mp4.length });
       return res.end(clip.mp4);
+    }
+
+    // The recordings the device keeps on its own storage, newest first (?start=&end= yyyyMMdd on the device's
+    // calendar, default the last 7 days; ?limit=), each with the URL of its cover.
+    if (kind === "records" && sn) {
+      const q = url.searchParams;
+      for (const k of ["start", "end"]) {
+        if (q.has(k) && !/^\d{8}$/.test(q.get(k))) return json(res, 400, { error: `${k} must be yyyyMMdd` });
+      }
+      const limit = q.has("limit") ? Number(q.get("limit")) : undefined;
+      if (limit !== undefined && !(Number.isInteger(limit) && limit > 0)) {
+        return json(res, 400, { error: "limit must be a positive integer" });
+      }
+      try {
+        const rows = await ctx.listRecords(sn, {
+          startDate: q.get("start") ?? undefined,
+          endDate: q.get("end") ?? undefined,
+          limit,
+        });
+        ctx.eventLog?.(`/records ${sn} → 200 ${rows.length} record(s)`);
+        const records = rows.map((r) => ({
+          ...r,
+          thumbnail: r.record_id != null ? `/record-thumbnail/${sn}/${r.record_id}` : undefined,
+        }));
+        return json(res, 200, { sn, count: records.length, records });
+      } catch (e) {
+        ctx.eventLog?.(`/records ${sn} → 502 ${e?.message ?? e}`);
+        return json(res, 502, { error: String(e?.message ?? e) });
+      }
+    }
+
+    // The cover of one recording /records listed, by its record_id.
+    if (kind === "record-thumbnail" && sn) {
+      const id = url.pathname.split("/")[3];
+      if (!id) return json(res, 400, { error: "record id required: /record-thumbnail/<sn>/<record_id>" });
+      try {
+        const jpeg = await ctx.recordThumbnail(sn, id);
+        if (!jpeg) return json(res, 404, { error: "no such record, or its cover did not arrive" });
+        res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length });
+        return res.end(jpeg);
+      } catch (e) {
+        ctx.eventLog?.(`/record-thumbnail ${sn}/${id} → 502 ${e?.message ?? e}`);
+        return json(res, 502, { error: String(e?.message ?? e) });
+      }
     }
 
     if (kind === "stream" && sn) {
