@@ -4,7 +4,9 @@
 // shared lock (`withDbLock`) serialises the face-roster warm, the boot image warm, and every live
 // refresh into one at-a-time queue. Kicked off the boot critical path (they don't gate `ready`).
 import fs from "node:fs";
-import { normalizePushImage } from "@mega-yfue/eufy-sdk";
+import { normalizePushImage, p2pCodec, getImageKey, getImageBaseCode, getImageSeed } from "@mega-yfue/eufy-sdk";
+import { createDecipheriv, createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { rosterEntry, firstJsonObject } from "./faces.mjs";
 import { storedThumbnailSeenAt } from "./stored-thumbnail.mjs";
@@ -634,6 +636,7 @@ export function createWarmup(ctx) {
   // Per device, record_id -> on-device cover path, from the last listing; a thumbnail is asked by record id
   // so a caller can only request covers the device itself listed.
   const recordCovers = new Map();
+  const recordRows = new Map();
 
   /**
    * The device's own recordings, newest first, via the SDK's `getStationRecords` (`startDate`/`endDate`
@@ -649,6 +652,9 @@ export function createWarmup(ctx) {
         if (rec.record_id != null && p) covers.set(String(rec.record_id), p);
       }
       recordCovers.set(sn, covers);
+      const byId = recordRows.get(sn) ?? new Map();
+      for (const rec of rows) if (rec.record_id != null) byId.set(String(rec.record_id), rec);
+      recordRows.set(sn, byId);
       return rows;
     });
   }
@@ -671,6 +677,261 @@ export function createWarmup(ctx) {
     });
   }
 
+  // ── EXPERIMENT (download-exp branch): dump one recording's raw download and try level-1 decryption ──
+  async function dumpRecording(sn, recordId) {
+    const id = String(recordId);
+    if (!recordRows.get(sn)?.has(id)) await listRecords(sn);
+    const rec = recordRows.get(sn)?.get(id);
+    if (!rec?.storage_path) return { error: "no such record" };
+    return withDbLock(async () => {
+      const stationSn = eufy.deviceState?.(sn)?.stationSn ?? sn;
+      const session = stationSessions().get(stationSn);
+      if (!session?.isConnected) return { error: "no connected session" };
+      const devs = await eufy.getDevices();
+      const accountId = await accountIdOf(devs);
+      const frames = [];
+      let finished = false;
+      let lastAt = 0;
+      const onData = (f) => {
+        if (f.dataType === 1 && (f.commandId === 1300 || f.commandId === 1301)) return;
+        if (![1300, 1301, 1303, 1304, 1024].includes(f.commandId) && f.dataType !== 3) return;
+        frames.push({
+          cmd: f.commandId,
+          ch: f.channel,
+          dt: f.dataType,
+          sign: f.signCode,
+          raw: Buffer.from(f.raw ?? []),
+          json: f.json,
+        });
+        lastAt = Date.now();
+        if (f.commandId === 1304) finished = true;
+      };
+      session.on("data", onData);
+      const pad = (str, n = 128) => {
+        const b = Buffer.from(str);
+        const out = Buffer.alloc(Math.max(n, Math.ceil(b.length / n) * n));
+        b.copy(out);
+        return out;
+      };
+      const seq = Buffer.alloc(2);
+      seq.writeUInt16BE(session.seqNumber, 0);
+      const c = Buffer.alloc(2);
+      c.writeUInt16LE(1024, 0);
+      const body = Buffer.concat([Buffer.alloc(5), pad(rec.storage_path), pad(accountId)]);
+      const [m0, m1] = session.nextClearCommandBytes();
+      const len = Buffer.alloc(2);
+      len.writeUInt16LE(body.length, 0);
+      const payload = Buffer.concat([len, Buffer.from([0, 0, m0, m1, 0, 0, 0, 0]), body]);
+      session.seqNumber = (session.seqNumber + 1) & 65535;
+      const started = Date.now();
+      session.send(
+        session.connectAddress,
+        Buffer.from([0xf1, 0xd0]),
+        Buffer.concat([Buffer.from([0xd1, 0x00]), seq, Buffer.from("XZYH"), c, payload]),
+      );
+      let outcome = "finished";
+      while (!finished) {
+        await sleep(250);
+        if (!lastAt && Date.now() - started > 20000) {
+          outcome = "no-data";
+          break;
+        }
+        if (lastAt && Date.now() - lastAt > 15000) {
+          outcome = "went-quiet";
+          break;
+        }
+        if (Date.now() - started > 180000) {
+          outcome = "timeout";
+          break;
+        }
+      }
+      session.off?.("data", onData);
+
+      const dir = path.join("/tmp/dumps", id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "frames.bin"), Buffer.concat(frames.map((f) => f.raw)));
+      fs.writeFileSync(
+        path.join(dir, "frames.jsonl"),
+        frames
+          .map((f) =>
+            JSON.stringify({
+              cmd: f.cmd,
+              ch: f.ch,
+              dt: f.dt,
+              sign: f.sign,
+              len: f.raw.length,
+              head: f.raw.subarray(0, 32).toString("hex"),
+              json: f.json,
+            }),
+          )
+          .join("\n") + "\n",
+      );
+
+      const p2pDid = p2pDidOf(devs, stationSn);
+      const key = Buffer.from(p2pCodec.p2pCommandEncryptionKey(stationSn, p2pDid));
+      const ecb = (buf) => {
+        const n = buf.length - (buf.length % 16);
+        const d = createDecipheriv("aes-128-ecb", key, null);
+        d.setAutoPadding(false);
+        return Buffer.concat([d.update(buf.subarray(0, n)), d.final(), buf.subarray(n)]);
+      };
+      const startCode = (b) =>
+        b[0] === 0 && b[1] === 0 && b[2] === 1 ? 3 : b[0] === 0 && b[1] === 0 && b[2] === 0 && b[3] === 1 ? 4 : 0;
+      const nalType = (b) => {
+        const sc = startCode(b);
+        return sc ? (b[sc] >> 1) & 0x3f : -1;
+      };
+      const variants = {
+        body: (raw, n) => ecb(raw.subarray(22, 22 + n)),
+        whole: (raw) => ecb(raw).subarray(22),
+        first128: (raw, n) => Buffer.concat([ecb(raw.subarray(22, 150)), raw.subarray(150, 22 + n)]),
+      };
+      const stats = {
+        frames: frames.length,
+        byCmd: {},
+        keyframes: 0,
+        deltas: 0,
+        variants: {},
+        keyHeads: [],
+        deltaHeads: [],
+      };
+      for (const f of frames)
+        stats.byCmd[`${f.cmd}/dt${f.dt}/s${f.sign}`] = (stats.byCmd[`${f.cmd}/dt${f.dt}/s${f.sign}`] ?? 0) + 1;
+      const out = Object.fromEntries(Object.keys(variants).map((k) => [k, []]));
+      for (const f of frames) {
+        if (f.cmd !== 1300 || f.raw.length < 22) continue;
+        const n = f.raw.readUInt32LE(0);
+        const flags = f.raw[4];
+        if (flags === 1) {
+          stats.deltas++;
+          if (stats.deltaHeads.length < 3)
+            stats.deltaHeads.push({ flags, n, raw: f.raw.length, nal: nalType(f.raw.subarray(22)) });
+          for (const k of Object.keys(out)) out[k].push(f.raw.subarray(22, 22 + n));
+          continue;
+        }
+        stats.keyframes++;
+        if (stats.keyHeads.length < 4) stats.keyHeads.push({ flags, n, raw: f.raw.length, sign: f.sign });
+        for (const [k, fn] of Object.entries(variants)) {
+          let d;
+          try {
+            d = fn(f.raw, n);
+          } catch {
+            d = undefined;
+          }
+          const v = (stats.variants[k] ??= { annexB: 0, nals: {} });
+          if (d && startCode(d)) {
+            v.annexB++;
+            v.nals[nalType(d)] = (v.nals[nalType(d)] ?? 0) + 1;
+          }
+          if (d) out[k].push(d);
+        }
+      }
+      for (const [k, bufs] of Object.entries(out))
+        if (bufs.length) fs.writeFileSync(path.join(dir, `clip-${k}.hevc`), Buffer.concat(bufs));
+      const reply = frames.find((f) => f.cmd === 1024)?.raw;
+      const code = reply ? reply.subarray(4).toString("latin1").replace(/\0+$/, "") : "";
+      stats.replyCodeShape = code ? `${code.length} chars, digits=${/^\d+$/.test(code)}` : "none";
+      const md5 = (x) => createHash("md5").update(x).digest();
+      const sha = (x) => createHash("sha256").update(x).digest();
+      const cands = {};
+      try {
+        const img = getImageKey(stationSn, p2pDid, code);
+        cands.imgUtf16 = Buffer.from(img, "utf-8").subarray(0, 16);
+        cands.imgUtf32 = Buffer.from(img, "utf-8").subarray(0, 32);
+        cands.imgHex = Buffer.from(img, "hex");
+        const base = getImageBaseCode(stationSn, p2pDid);
+        const seed = getImageSeed(p2pDid, code);
+        cands.baseUtf16 = Buffer.from(base, "utf-8").subarray(0, 16);
+        cands.seedUtf16 = Buffer.from(String(seed), "utf-8").subarray(0, 16);
+        cands.baseSeedSha16 = sha(`01${base}${seed}`).subarray(0, 16);
+      } catch (e) {
+        stats.imgKeyError = String(e?.message ?? e);
+      }
+      cands.level1 = key;
+      cands.codePad16 = Buffer.concat([Buffer.from(code), Buffer.alloc(16)]).subarray(0, 16);
+      cands.codeMd5 = md5(code);
+      cands.codeSha16 = sha(code).subarray(0, 16);
+      cands.codeSha32 = sha(code);
+      const dec = (k, buf) => {
+        const alg = k.length === 32 ? "aes-256-ecb" : k.length === 24 ? "aes-192-ecb" : "aes-128-ecb";
+        const n = buf.length - (buf.length % 16);
+        const d = createDecipheriv(alg, k, null);
+        d.setAutoPadding(false);
+        return Buffer.concat([d.update(buf.subarray(0, n)), d.final(), buf.subarray(n)]);
+      };
+      const isSps = (b) =>
+        b[0] === 0 &&
+        b[1] === 0 &&
+        ((b[2] === 0 && b[3] === 1 && (b[4] & 0x1f) === 7) || (b[2] === 1 && (b[3] & 0x1f) === 7));
+      const firstKey = frames.find((f) => f.cmd === 1300 && f.raw[4] === 7)?.raw;
+      stats.keyTest = {};
+      let found;
+      for (const [name, k] of Object.entries(cands)) {
+        if (![16, 24, 32].includes(k?.length)) {
+          stats.keyTest[name] = `bad length ${k?.length}`;
+          continue;
+        }
+        const head = dec(k, firstKey.subarray(22, 22 + 32));
+        stats.keyTest[name] = isSps(head) ? "SPS" : `no (${head.subarray(0, 5).toString("hex")})`;
+        if (!found && isSps(head)) found = [name, k];
+      }
+      if (found) {
+        stats.found = found[0];
+        for (const [label, extent] of [
+          ["all", Infinity],
+          ["256", 256],
+          ["128", 128],
+        ]) {
+          const bufs = [];
+          for (const f of frames) {
+            if (f.cmd !== 1300 || f.raw.length < 22) continue;
+            const n = f.raw.readUInt32LE(0);
+            const body = f.raw.subarray(22, 22 + n);
+            if (f.raw[4] !== 7) {
+              bufs.push(body);
+              continue;
+            }
+            const m = Math.min(body.length, extent);
+            bufs.push(Buffer.concat([dec(found[1], body.subarray(0, m)), body.subarray(m)]));
+          }
+          const file = path.join(dir, `clip-${label}.h264`);
+          fs.writeFileSync(file, Buffer.concat(bufs));
+          let errs;
+          try {
+            errs = execFileSync("ffmpeg", ["-v", "error", "-f", "h264", "-i", file, "-f", "null", "-"], {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+          } catch (e) {
+            errs = String(e.stderr ?? e.message);
+          }
+          const lines = String(errs).split("\n").filter(Boolean);
+          stats[`ffmpeg_${label}`] = { errorLines: lines.length, sample: lines.slice(0, 3) };
+        }
+      }
+      const audio = frames
+        .filter((f) => f.cmd === 1301 && f.raw.length > 16)
+        .map((f) => f.raw.subarray(16, 16 + f.raw.readUInt32LE(0)));
+      if (audio.length) fs.writeFileSync(path.join(dir, "audio.aac"), Buffer.concat(audio));
+      const summary = {
+        record: {
+          id,
+          path: rec.storage_path,
+          cipher_id: rec.cipher_id,
+          frame_num: rec.frame_num,
+          folder_size: rec.folder_size,
+        },
+        outcome,
+        ms: Date.now() - started,
+        dir,
+        ...stats,
+        audioFrames: audio.length,
+      };
+      fs.writeFileSync(path.join(dir, "summary.json"), JSON.stringify(summary, null, 2));
+      return summary;
+    });
+  }
+
   // EUFY_LOCAL_EVENT_REFRESH=0 (bridge #139): skip the HomeBase/local-storage P2P reads for an account
   // where they return nothing but still hammer the camera — the on-detection cover refresh, the startup
   // face-roster + last-event warm-ups, and the /event-image auto-heal. The push-thumbnail path
@@ -689,5 +950,6 @@ export function createWarmup(ctx) {
     autoHealEventImage: localEventRefresh ? autoHealEventImage : noop,
     listRecords,
     recordThumbnail,
+    dumpRecording,
   };
 }

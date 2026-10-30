@@ -327,6 +327,17 @@ export function createHttpHandler(ctx) {
       }
     }
 
+    // EXPERIMENT (download-exp): download one recording's raw frames to data/dumps and try decryption.
+    if (kind === "dev-record-dump" && sn) {
+      const id = url.pathname.split("/")[3];
+      if (!id) return json(res, 400, { error: "record id required" });
+      try {
+        return json(res, 200, await ctx.dumpRecording(sn, id));
+      } catch (e) {
+        return json(res, 502, { error: String(e?.message ?? e), stack: String(e?.stack ?? "").slice(0, 800) });
+      }
+    }
+
     // The cover of one recording /records listed, by its record_id.
     if (kind === "record-thumbnail" && sn) {
       const id = url.pathname.split("/")[3];
