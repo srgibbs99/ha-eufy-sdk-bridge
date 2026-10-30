@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHttpHandler } from "../src/http-routes.mjs";
 import { createWarmup } from "../src/warmup.mjs";
+import { createClips } from "../src/clip.mjs";
 import { createState } from "../src/state.mjs";
 import { loadConfig } from "../src/config.mjs";
 
@@ -29,7 +30,7 @@ const ROWS = [
   },
 ];
 
-function setup({ rows = ROWS, records } = {}) {
+function setup({ rows = ROWS, records, download, noDownload = false } = {}) {
   const session = new EventEmitter();
   session.isConnected = true;
   session.images = [];
@@ -39,6 +40,23 @@ function setup({ rows = ROWS, records } = {}) {
     setTimeout(() => session.emit("image", { file, data: jpeg }), 0);
   };
   const calls = [];
+  const downloads = [];
+  const cam = noDownload
+    ? {}
+    : {
+        downloadRecording: async (opts) => {
+          downloads.push(opts);
+          if (download) return download(opts);
+          return {
+            video: Buffer.from("V"),
+            audio: Buffer.from("A"),
+            frames: 2,
+            missingFrames: 0,
+            durationMs: 67,
+            fps: 15,
+          };
+        },
+      };
   const state = createState();
   state.flags.ready = true;
   const ctx = {
@@ -57,10 +75,12 @@ function setup({ rows = ROWS, records } = {}) {
       getP2pSessions: () => new Map([["CAM1", session]]),
       getDevices: async () => [{ sn: "CAM1", raw: { member: { admin_user_id: "ADMIN-0000" } } }],
       deviceState: (sn) => ({ sn, stationSn: sn }),
+      getDevice: async () => ({ camera: () => cam }),
     },
+    muxClip: async (clip, out) => fs.promises.writeFile(out, Buffer.concat([Buffer.from("MP4:"), clip.video])),
   };
-  Object.assign(ctx, createWarmup(ctx));
-  return { handler: createHttpHandler(ctx), calls, session };
+  Object.assign(ctx, createWarmup(ctx), createClips(ctx));
+  return { handler: createHttpHandler(ctx), calls, session, downloads };
 }
 
 async function get(handler, url) {
@@ -141,4 +161,37 @@ test("an id the device does not list is a 404, and nothing is requested from it"
   const r = await get(handler, "/record-thumbnail/CAM1/99");
   assert.equal(r.code, 404);
   assert.deepEqual(session.images, []);
+});
+
+test("serves a listed recording as an mp4, downloaded by the name its storage_path gives", async () => {
+  const { handler, downloads } = setup();
+  const r = await get(handler, "/record-clip/CAM1/11");
+  assert.equal(r.code, 200);
+  assert.equal(r.headers["content-type"], "video/mp4");
+  assert.deepEqual(r.body, Buffer.from("MP4:V"));
+  assert.deepEqual(downloads, [{ recording: "v_11", cipherId: 0 }]);
+});
+
+test("a recording id the device does not list is a 404, and nothing is downloaded", async () => {
+  const { handler, downloads } = setup();
+  const r = await get(handler, "/record-clip/CAM1/99");
+  assert.equal(r.code, 404);
+  assert.deepEqual(downloads, []);
+});
+
+test("a failed download is a 502 carrying the SDK's reason", async () => {
+  const { handler } = setup({
+    download: async () => {
+      throw Object.assign(new Error("the station sent nothing within 20000 ms"), { reason: "no-data" });
+    },
+  });
+  const r = await get(handler, "/record-clip/CAM1/12");
+  assert.equal(r.code, 502);
+  assert.equal(r.json.reason, "no-data");
+});
+
+test("a device without stored recordings is a 404", async () => {
+  const { handler } = setup({ noDownload: true });
+  const r = await get(handler, "/record-clip/CAM1/12");
+  assert.equal(r.code, 404);
 });

@@ -3,6 +3,7 @@
 // station's P2P session without waking the camera, and the bundled ffmpeg muxes the elementary streams
 // it returns (no re-encode). One file per camera holds the latest clip, so nothing needs pruning.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 
@@ -107,5 +108,44 @@ export function createClips(ctx) {
     }
   }
 
-  return { noteRecording, clipFor };
+  // /record-clip/<sn>/<record_id>: one of the recordings the device lists (/records), as an mp4. Requests for
+  // the same recording share one download; nothing is kept on disk afterwards.
+  const recordBuilds = new Map(); // `${sn}/${id}` -> Promise<Buffer>
+
+  /** One listed recording as `{ mp4 }`, or `{ status, error, reason? }`. */
+  async function recordClipFor(sn, recordId) {
+    const key = `${sn}/${recordId}`;
+    let pending = recordBuilds.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const got = await ctx.recordDownload(sn, recordId);
+        if (!got) return undefined;
+        const tmp = path.join(os.tmpdir(), `record-${sn}-${recordId}-${process.pid}.mp4`);
+        try {
+          await mux(got.clip, tmp);
+          log(
+            `/record-clip ${sn}/${recordId} → ${got.row.start_time}: ${got.clip.frames} frames, ` +
+              `${got.clip.missingFrames} missing, ${got.clip.durationMs} ms${got.clip.audio?.length ? ", with audio" : ""}`,
+          );
+          return await fs.promises.readFile(tmp);
+        } finally {
+          await fs.promises.rm(tmp, { force: true });
+        }
+      })();
+      recordBuilds.set(key, pending);
+      pending.finally(() => recordBuilds.delete(key)).catch(() => {});
+    }
+    try {
+      const mp4 = await pending;
+      return mp4 ? { mp4 } : { status: 404, error: "no such record" };
+    } catch (e) {
+      log(`/record-clip ${sn}/${recordId} failed: ${e?.message ?? e}`);
+      if (e?.status) return { status: e.status, error: String(e.message) };
+      return e?.reason
+        ? { status: 502, error: String(e.message), reason: e.reason }
+        : { status: 500, error: String(e?.message ?? e) };
+    }
+  }
+
+  return { noteRecording, clipFor, recordClipFor };
 }

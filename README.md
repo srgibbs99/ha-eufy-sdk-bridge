@@ -16,6 +16,7 @@ HTTP  :3000/snapshot/<sn>  a JPEG still
 HTTP  :3000/clip/<sn>      the latest detection's recording, as an mp4 (HomeBase 2)
 HTTP  :3000/records/<sn>   the recordings the device keeps on its own storage (JSON)
 HTTP  :3000/record-thumbnail/<sn>/<record_id>   one listed recording's cover (JPEG)
+HTTP  :3000/record-clip/<sn>/<record_id>        one listed recording, as an mp4
 HTTP  :3000/healthz        which cameras are streaming
 ```
 

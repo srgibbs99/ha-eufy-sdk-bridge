@@ -327,6 +327,16 @@ export function createHttpHandler(ctx) {
       }
     }
 
+    // One recording /records listed, by its record_id, downloaded from the device and muxed to mp4.
+    if (kind === "record-clip" && sn) {
+      const id = url.pathname.split("/")[3];
+      if (!id) return json(res, 400, { error: "record id required: /record-clip/<sn>/<record_id>" });
+      const clip = await ctx.recordClipFor(sn, id);
+      if (!clip.mp4) return json(res, clip.status, { error: clip.error, reason: clip.reason });
+      res.writeHead(200, { "content-type": "video/mp4", "content-length": clip.mp4.length });
+      return res.end(clip.mp4);
+    }
+
     // The cover of one recording /records listed, by its record_id.
     if (kind === "record-thumbnail" && sn) {
       const id = url.pathname.split("/")[3];

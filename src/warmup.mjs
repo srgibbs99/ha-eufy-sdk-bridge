@@ -634,6 +634,8 @@ export function createWarmup(ctx) {
   // Per device, record_id -> on-device cover path, from the last listing; a thumbnail is asked by record id
   // so a caller can only request covers the device itself listed.
   const recordCovers = new Map();
+  // Per device, record_id -> the row the last listing returned, for /record-clip.
+  const recordRows = new Map();
 
   /**
    * The device's own recordings, newest first, via the SDK's `getStationRecords` (`startDate`/`endDate`
@@ -649,6 +651,9 @@ export function createWarmup(ctx) {
         if (rec.record_id != null && p) covers.set(String(rec.record_id), p);
       }
       recordCovers.set(sn, covers);
+      const byId = recordRows.get(sn) ?? new Map();
+      for (const rec of rows) if (rec.record_id != null) byId.set(String(rec.record_id), rec);
+      recordRows.set(sn, byId);
       return rows;
     });
   }
@@ -671,6 +676,29 @@ export function createWarmup(ctx) {
     });
   }
 
+  /**
+   * Download one of the device's recordings, by `record_id`, through the SDK's `camera().downloadRecording`:
+   * the recording name is its row's `storage_path` file name without the extension. Answers
+   * `{ row, clip }` with the SDK's elementary streams, or undefined when the device lists no such record. An id
+   * not seen yet triggers a default listing first. Under the DB lock, so no other read shares the session
+   * while the device sends the recording. Rejects as `downloadRecording` does.
+   */
+  async function recordDownload(sn, recordId) {
+    const id = String(recordId);
+    if (!recordRows.get(sn)?.has(id)) await listRecords(sn);
+    const row = recordRows.get(sn)?.get(id);
+    if (typeof row?.storage_path !== "string") return undefined;
+    const recording = path.basename(row.storage_path).replace(/\.[^.]*$/, "");
+    return withDbLock(async () => {
+      const cam = (await eufy.getDevice(sn)).camera?.();
+      if (typeof cam?.downloadRecording !== "function") {
+        throw Object.assign(new Error("no stored recordings on this device"), { status: 404 });
+      }
+      const clip = await cam.downloadRecording({ recording, cipherId: Number(row.cipher_id ?? 0) });
+      return { row, clip };
+    });
+  }
+
   // EUFY_LOCAL_EVENT_REFRESH=0 (bridge #139): skip the HomeBase/local-storage P2P reads for an account
   // where they return nothing but still hammer the camera — the on-detection cover refresh, the startup
   // face-roster + last-event warm-ups, and the /event-image auto-heal. The push-thumbnail path
@@ -689,5 +717,6 @@ export function createWarmup(ctx) {
     autoHealEventImage: localEventRefresh ? autoHealEventImage : noop,
     listRecords,
     recordThumbnail,
+    recordDownload,
   };
 }
