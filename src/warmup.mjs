@@ -197,6 +197,14 @@ export function createWarmup(ctx) {
     return taken;
   }
 
+  /**
+   * A station's session (re)connected: ask it the latest-info query again. The silent count stops the query on a
+   * station that never answers it, but a session that went dead counts the same way, and a fresh one does answer.
+   */
+  function onStationConnect(stationSn) {
+    latestInfoSilent.delete(stationSn);
+  }
+
   /** Mark a latest-info crop as seen once its image has been fetched. */
   function noteFetched(rec, filePath) {
     if (rec?.viaLatestInfo) latestInfoPath.set(rec.device_sn, filePath);
@@ -644,7 +652,14 @@ export function createWarmup(ctx) {
    */
   function listRecords(sn, opts = {}) {
     return withDbLock(async () => {
-      const rows = await eufy.getStationRecords(sn, opts);
+      let rows;
+      try {
+        rows = await eufy.getStationRecords(sn, opts);
+      } catch (e) {
+        await ctx.noteListFailure?.(sn, e); // may reconnect the station's session, still under the lock
+        throw e;
+      }
+      ctx.noteListSuccess?.(sn);
       const covers = recordCovers.get(sn) ?? new Map();
       for (const rec of rows) {
         const p = cropPathOf(rec);
@@ -718,5 +733,6 @@ export function createWarmup(ctx) {
     listRecords,
     recordThumbnail,
     recordDownload,
+    onStationConnect,
   };
 }

@@ -87,6 +87,7 @@ export function createBoot(ctx) {
         eufy.on("push", (ev) => dbg(pushFieldSummary(ev)));
       }
       eufy.on("push", (ev) => ctx.noteRecording?.(ev)); // the recording a detection named, for /clip
+      eufy.on("p2pConnect", (sn) => ctx.onStationConnect?.(sn)); // a fresh session answers latest-info again
       for (const e of FORWARDED_EVENTS)
         eufy.on(e, (payload) => {
           const detection = DETECTION_EVENTS.has(e);

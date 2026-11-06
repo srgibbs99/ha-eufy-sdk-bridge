@@ -158,6 +158,17 @@ test("a station silent on both forms stops being asked latest-info after three t
   assert.ok(log.includes("history query: no records parsed (raw 0B received; latest-info unanswered too)"));
 });
 
+test("a reconnected station is asked latest-info again after it went silent", async () => {
+  const station = fakeStation({});
+  const { warm } = setup(station);
+
+  for (let i = 0; i < 4; i++) await run(() => warm.refreshLastEventImageFor("CAM1"));
+  assert.equal(station.asked.filter((a) => a === "10013@0").length, 3);
+  warm.onStationConnect("HB2");
+  await run(() => warm.refreshLastEventImageFor("CAM1"));
+  assert.equal(station.asked.filter((a) => a === "10013@0").length, 4);
+});
+
 test("a cover answered inside the eufysecurity: wrapper is unwrapped and persisted as a JPEG", async () => {
   const path = "/media/mmcblk0p1/video/20261013100000_c01.jpg";
   const station = fakeStation({ latest: latestFor(path, 41) });

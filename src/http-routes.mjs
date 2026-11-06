@@ -112,6 +112,7 @@ export function createHttpHandler(ctx) {
         streamIdleMs: cfg.streamIdleMs, // 0 = idle auto-off disabled
         pushConnected: flags.pushConnected, // FCM push channel — events (motion/doorbell/…) ride this
         pushIdleSec: flags.pushConnected ? 0 : Math.round((Date.now() - flags.pushSince) / 1000),
+        databaseReads: ctx.databaseReadHealth?.() ?? {}, // per station: do its P2P database reads answer (db-recovery.mjs)
       });
     }
     if (!flags.ready) return json(res, 503, { error: "not authenticated", auth: ctx.authStatus() });

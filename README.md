@@ -17,8 +17,14 @@ HTTP  :3000/clip/<sn>      the latest detection's recording, as an mp4 (HomeBase
 HTTP  :3000/records/<sn>   the recordings the device keeps on its own storage (JSON)
 HTTP  :3000/record-thumbnail/<sn>/<record_id>   one listed recording's cover (JPEG)
 HTTP  :3000/record-clip/<sn>/<record_id>        one listed recording, as an mp4
-HTTP  :3000/healthz        which cameras are streaming
+HTTP  :3000/healthz        which cameras are streaming, and whether each station answers database reads
 ```
+
+A station's P2P session can go silent without closing, and every recordings list on it then times out. After
+three such timeouts in a row over at least a minute, the bridge closes that station's session and reads one page
+on a fresh one; if that doesn't help, it tries again after 10, then 30, then every 60 minutes, and only when a
+list has just failed. A live viewer is never cut off: failures during live view aren't counted, and a viewer has
+its own session. `/healthz` shows the state under `databaseReads`.
 
 Video is deliberately **not** on the WebSocket: the WS hands back a URL, and _connecting to that URL
 is what starts the camera — disconnecting is what stops it_. There is no "stream is running" flag to
